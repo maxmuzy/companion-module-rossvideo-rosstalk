@@ -5,8 +5,11 @@
 // with `No source or Unknown source`. Discovery probes those queries one at a time to find out how many
 // inputs / AUX buses / MLEs exist and what the inputs are called.
 
-const QUERY_TIMEOUT = 1500
-const MAX_TIMEOUTS_IN_A_ROW = 3
+const { TCPHelper, InstanceStatus } = require('@companion-module/base')
+
+const QUERY_TIMEOUT = 1000
+const CONNECT_TIMEOUT = 5000
+const MAX_TIMEOUTS_WITHOUT_ANY_REPLY = 3
 
 const MAX_INPUTS = 128
 const MAX_INPUT_MISSES_IN_A_ROW = 3
@@ -14,6 +17,7 @@ const MAX_AUX_BANKS = 16
 const MAX_AUX_BANK_MISSES_IN_A_ROW = 2
 const MAX_AUX_PER_BANK = 64
 const MAX_MES = 8
+const TRACE_SIZE = 8
 
 // Start of the error texts the switcher answers with when a queried source does not exist
 const ERROR_REPLY = /^(no source|unknown|invalid|error|syntax|not )/i
@@ -25,7 +29,80 @@ class ScanAborted extends Error {
 	}
 }
 
+// Sends queries over a socket and matches each one with the next line the switcher sends back.
+// One query at a time: the answers carry no identifier.
+class QuerySession {
+	constructor(socket, onUnsolicited, log) {
+		this.socket = socket
+		this.onUnsolicited = onUnsolicited
+		this.log = log
+		this.buffer = ''
+		this.pending = null
+	}
+
+	handleData(data) {
+		this.buffer += data.toString('latin1')
+		const lines = this.buffer.split(/\r\n|\n|\r/)
+		this.buffer = lines.pop()
+		for (const line of lines) this.handleLine(line.trim())
+	}
+
+	handleLine(text) {
+		// Terminator quirks can leave blank lines behind, they never are an answer
+		if (text === '') return
+
+		const pending = this.pending
+		if (pending === null) {
+			this.onUnsolicited(text)
+		} else if (text.toLowerCase() !== pending.cmd.toLowerCase()) {
+			// (a line equal to the query itself is the switcher echoing what it received)
+			this.pending = null
+			clearTimeout(pending.timer)
+			pending.resolve(text)
+		}
+	}
+
+	// Resolves with the reply line, or null if there was none in time (or no connection)
+	query(cmd, timeout) {
+		return new Promise((resolve) => {
+			if (!this.socket.isConnected || this.pending !== null) {
+				resolve(null)
+				return
+			}
+
+			// Drop whatever is left of the previous answer
+			this.buffer = ''
+			const timer = setTimeout(() => {
+				this.pending = null
+				// Some firmwares might not terminate the line, in which case the text is still sitting here
+				const partial = this.buffer.trim()
+				this.buffer = ''
+				resolve(partial !== '' && partial.toLowerCase() !== cmd.toLowerCase() ? partial : null)
+			}, timeout)
+			this.pending = { cmd, resolve, timer }
+
+			this.log('debug', `Query: ${cmd}`)
+			this.socket.send(cmd + '\r\n').catch((err) => {
+				this.log('error', `Failed to send ${cmd}: ${err.message}`)
+				this.cancel()
+			})
+		})
+	}
+
+	cancel() {
+		if (this.pending !== null) {
+			const pending = this.pending
+			this.pending = null
+			clearTimeout(pending.timer)
+			pending.resolve(null)
+		}
+		this.buffer = ''
+	}
+}
+
 module.exports = {
+	QuerySession,
+
 	resetDiscovery() {
 		let self = this
 		self.cancelDiscovery()
@@ -36,8 +113,8 @@ module.exports = {
 	cancelDiscovery() {
 		let self = this
 		self.discoveryRun++
-		self.rejectPending()
-		self.rxBuffer = ''
+		if (self.session) self.session.cancel()
+		if (self.scanSession) self.scanSession.cancel()
 		self.discovering = false
 		for (const cmd of self.queuedWrites) {
 			self.log('warn', `Command dropped, connection lost during scan: ${cmd}`)
@@ -45,117 +122,133 @@ module.exports = {
 		self.queuedWrites = []
 	},
 
-	rejectPending() {
-		let self = this
-		if (self.pendingQuery) {
-			const pending = self.pendingQuery
-			self.pendingQuery = null
-			clearTimeout(pending.timer)
-			pending.resolve(null)
-		}
+	// Why a scan would not run, or undefined if it can
+	scanBlocker() {
+		if (this.config.discover === false) return 'disabled in the module configuration'
+		if (this.config.model !== 'acuity') return 'only available for the Acuity/Vision model'
+		if (!this.config.host) return 'no host configured'
+		return undefined
 	},
 
-	// Everything the switcher sends back arrives here. The first line goes to the query that is waiting for
-	// it; anything else (e.g. answers to commands when "Cmd Response" is on) is just logged.
-	handleData(data) {
+	// Called by the module once the configuration is applied (without Keep Alive) or the connection is up (with it)
+	scan() {
 		let self = this
-		self.rxBuffer += data.toString('latin1')
-		const lines = self.rxBuffer.split(/\r\n|\n|\r/)
-		self.rxBuffer = lines.pop()
+		const blocker = self.scanBlocker()
+		if (blocker) {
+			if (self.config.discover !== false) self.log('info', `Switcher scan skipped: ${blocker}`)
+			return Promise.resolve()
+		}
 
-		for (const line of lines) {
-			const text = line.trim()
-			if (self.pendingQuery) {
-				const pending = self.pendingQuery
-				self.pendingQuery = null
-				clearTimeout(pending.timer)
-				pending.resolve(text)
-			} else if (text !== '') {
-				self.logRx(text)
+		if (self.config.keepAlive) {
+			if (self.socket === undefined || !self.socket.isConnected) {
+				self.log('warn', 'Not connected, cannot scan the switcher')
+				return Promise.resolve()
 			}
+			return self.executeScan(self.session, true)
 		}
+
+		// Same queue as the commands, so the switcher never sees two connections at once
+		self.oneShotChain = self.oneShotChain.then(() => self.scanWithTemporaryConnection())
+		return self.oneShotChain
 	},
 
-	// Sends a query and resolves with the reply line, or null if there was none in time (or no connection)
-	queryCommand(cmd, timeout = QUERY_TIMEOUT) {
+	// Without Keep Alive: connect just for the scan. Never rejects.
+	scanWithTemporaryConnection() {
 		let self = this
 		return new Promise((resolve) => {
-			if (self.socket === undefined || !self.socket.isConnected || self.pendingQuery) {
-				resolve(null)
-				return
+			const host = self.config.host
+			const port = self.getPort()
+			const socket = new TCPHelper(host, port, { reconnect: false })
+			self.oneShotSockets.add(socket)
+
+			let session = null
+			let finished = false
+			const finish = () => {
+				if (finished) return
+				finished = true
+				clearTimeout(connectTimer)
+				if (session) session.cancel()
+				if (self.scanSession === session) self.scanSession = null
+				self.oneShotSockets.delete(socket)
+				socket.destroy()
+				resolve()
 			}
+			const connectTimer = setTimeout(() => {
+				self.log('error', `Timed out connecting to ${host}, switcher not scanned`)
+				self.updateStatus(InstanceStatus.ConnectionFailure, 'Timeout')
+				finish()
+			}, CONNECT_TIMEOUT)
 
-			const timer = setTimeout(() => {
-				self.pendingQuery = null
-				// Some firmwares might not terminate the line, in which case the text is still sitting here
-				const partial = self.rxBuffer.trim()
-				self.rxBuffer = ''
-				resolve(partial !== '' ? partial : null)
-			}, timeout)
-			self.pendingQuery = { resolve, timer }
-
-			self.log('debug', `Query: ${cmd}`)
-			self.socket.send(cmd + '\r\n').catch((err) => {
-				self.log('error', `Failed to send ${cmd}: ${err.message}`)
-				self.rejectPending()
+			socket.on('connect', async () => {
+				clearTimeout(connectTimer)
+				self.updateStatus(InstanceStatus.Ok)
+				session = new QuerySession(
+					socket,
+					(text) => self.logRx(text),
+					(level, message) => self.log(level, message)
+				)
+				self.scanSession = session
+				try {
+					await self.executeScan(session, false)
+				} catch (err) {
+					self.log('error', `Scan failed: ${err.message}`)
+				}
+				finish()
+			})
+			socket.on('data', (data) => {
+				if (session) session.handleData(data)
+			})
+			socket.on('error', (err) => {
+				self.log('error', `Network error: ${err.message}, switcher not scanned`)
+				self.updateStatus(InstanceStatus.ConnectionFailure, err.code)
+				finish()
+			})
+			socket.on('end', () => {
+				if (finished) return
+				self.log('warn', `${host} closed the connection during the scan`)
+				finish()
 			})
 		})
 	},
 
-	async discover() {
+	// holdWrites: with a persistent connection, commands wait until the scan is done so their
+	// replies (if the switcher sends any) cannot be mistaken for the answer to a query
+	async executeScan(session, holdWrites) {
 		let self = this
-		if (self.config.discover === false || self.config.model !== 'acuity' || !self.config.keepAlive) return
-		if (self.socket === undefined || !self.socket.isConnected) {
-			self.log('warn', 'Not connected, cannot scan the switcher')
-			return
-		}
 
 		const runId = ++self.discoveryRun
 		const stale = () => runId !== self.discoveryRun
-		self.discovering = true
-		self.rxBuffer = ''
-		self.log('info', 'Scanning switcher (version, MLEs, inputs, AUX buses)')
+		const timeout = self.queryTimeout ?? QUERY_TIMEOUT
+		if (holdWrites) self.discovering = true
+		self.log('info', 'Scanning switcher (inputs, AUX buses, MLEs, version)')
 
-		let timeoutsInARow = 0
-		// Resolves { ok: boolean, value: string }. A reply that is empty or an error text means "does not exist"
-		const probe = async (cmd) => {
-			const reply = await self.queryCommand(cmd)
+		let timeoutsWithoutReply = 0
+		let replies = 0
+		const trace = []
+
+		// Resolves { ok, value }. A reply that is an error text means "does not exist"; so does no reply at all.
+		// Optional probes (ok to be unsupported by the switcher) never make the scan give up.
+		const probe = async (cmd, optional = false) => {
+			const reply = await session.query(cmd, timeout)
 			if (stale()) throw new ScanAborted()
+			if (trace.length < TRACE_SIZE) trace.push(`${cmd} -> ${reply === null ? '(no reply)' : JSON.stringify(reply)}`)
+
 			if (reply === null) {
-				if (++timeoutsInARow >= MAX_TIMEOUTS_IN_A_ROW) {
+				if (!optional && replies === 0 && ++timeoutsWithoutReply >= MAX_TIMEOUTS_WITHOUT_ANY_REPLY) {
 					throw new ScanAborted(
 						'The switcher is not answering queries, scan aborted. If this keeps happening, check the "Cmd Response" option of the RossTalk port in Com Setup.'
 					)
 				}
 				return { ok: false }
 			}
-			timeoutsInARow = 0
+			replies++
 			self.log('debug', `Reply to ${cmd}: ${reply}`)
-			return reply === '' || ERROR_REPLY.test(reply) ? { ok: false } : { ok: true, value: reply }
+			return ERROR_REPLY.test(reply) ? { ok: false } : { ok: true, value: reply }
 		}
 
 		const found = { version: undefined, mePrefix: undefined, mes: [], inputs: [], aux: [] }
 		try {
-			let r = await probe('VERSION')
-			if (r.ok) found.version = r.value
-
-			// Vision wants MLE where Acuity accepts both, so see which one this switcher understands
-			for (const prefix of ['MLE', 'ME']) {
-				r = await probe(`XPT ${prefix}:1:PGM:?`)
-				if (r.ok) {
-					found.mePrefix = prefix
-					found.mes.push(1)
-					break
-				}
-			}
-			if (found.mePrefix) {
-				for (let me = 2; me <= MAX_MES; me++) {
-					r = await probe(`XPT ${found.mePrefix}:${me}:PGM:?`)
-					if (!r.ok) break
-					found.mes.push(me)
-				}
-			}
-
+			let r
 			let misses = 0
 			for (let input = 1; input <= MAX_INPUTS && misses < MAX_INPUT_MISSES_IN_A_ROW; input++) {
 				r = await probe(`MNEM IN:${input}:?`)
@@ -179,15 +272,39 @@ module.exports = {
 				bankMisses = count > 0 ? 0 : bankMisses + 1
 			}
 
+			// Vision wants MLE where Acuity accepts both, so see which one this switcher understands
+			for (const prefix of ['MLE', 'ME']) {
+				r = await probe(`XPT ${prefix}:1:PGM:?`, true)
+				if (r.ok) {
+					found.mePrefix = prefix
+					found.mes.push(1)
+					break
+				}
+			}
+			if (found.mePrefix) {
+				for (let me = 2; me <= MAX_MES; me++) {
+					r = await probe(`XPT ${found.mePrefix}:${me}:PGM:?`, true)
+					if (!r.ok) break
+					found.mes.push(me)
+				}
+			}
+
+			r = await probe('VERSION', true)
+			if (r.ok) found.version = r.value
+
 			self.discovery = found
 			self.refreshVariables()
 			self.actions()
-			self.log('info', self.describeDiscovery())
+			if (found.inputs.length === 0 && found.aux.length === 0) {
+				self.log('warn', `Scan found no inputs and no AUX buses. First exchanges: ${trace.join(' | ')}`)
+			} else {
+				self.log('info', self.describeDiscovery())
+			}
 		} catch (err) {
 			if (!(err instanceof ScanAborted)) throw err
-			if (!err.silent) self.log('warn', err.message)
+			if (!err.silent) self.log('warn', `${err.message} First exchanges: ${trace.join(' | ')}`)
 		} finally {
-			if (!stale()) {
+			if (holdWrites && !stale()) {
 				self.discovering = false
 				const queued = self.queuedWrites
 				self.queuedWrites = []
@@ -238,7 +355,7 @@ module.exports = {
 	// Actions that depend on what the scan found
 	discoveryActions() {
 		let self = this
-		if (self.config.model !== 'acuity' || !self.config.keepAlive || self.config.discover === false) return {}
+		if (self.config.model !== 'acuity' || self.config.discover === false) return {}
 
 		const d = self.discovery
 		const actions = {
@@ -246,7 +363,7 @@ module.exports = {
 				name: 'Re-scan switcher (input names, AUX buses, MLEs)',
 				options: [],
 				callback: async () => {
-					await self.discover()
+					await self.scan()
 				},
 			},
 		}

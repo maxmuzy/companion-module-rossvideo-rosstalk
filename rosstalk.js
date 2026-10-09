@@ -14,8 +14,8 @@ class RossTalkInstance extends InstanceBase {
 		super(internal)
 		let self = this
 
-		self.rxBuffer = ''
-		self.pendingQuery = null
+		self.session = null
+		self.scanSession = null
 		self.discovering = false
 		self.discoveryRun = 0
 		self.queuedWrites = []
@@ -57,6 +57,7 @@ class RossTalkInstance extends InstanceBase {
 		} else {
 			self.closeSocket()
 			self.updateStatus(InstanceStatus.Ok)
+			self.scan()
 		}
 	}
 
@@ -178,6 +179,11 @@ class RossTalkInstance extends InstanceBase {
 		const host = self.config.host
 		const port = self.getPort()
 		self.socket = new TCPHelper(host, port)
+		self.session = new discovery.QuerySession(
+			self.socket,
+			(text) => self.logRx(text),
+			(level, message) => self.log(level, message)
+		)
 
 		self.socket.on('status_change', function (status, message) {
 			if (status !== 'unknown_error') {
@@ -194,7 +200,7 @@ class RossTalkInstance extends InstanceBase {
 		self.socket.on('connect', function () {
 			self.updateStatus(InstanceStatus.Ok)
 			self.log('info', `Connected to ${host}:${port}`)
-			self.discover().catch((err) => self.log('error', `Scan failed: ${err.message}`))
+			self.scan().catch((err) => self.log('error', `Scan failed: ${err.message}`))
 		})
 
 		self.socket.on('end', function () {
@@ -206,13 +212,14 @@ class RossTalkInstance extends InstanceBase {
 		})
 
 		self.socket.on('data', function (data) {
-			self.handleData(data)
+			self.session.handleData(data)
 		})
 	}
 
 	closeSocket() {
 		let self = this
 		self.cancelDiscovery()
+		self.session = null
 		if (self.socket !== undefined) {
 			self.socket.destroy()
 			delete self.socket

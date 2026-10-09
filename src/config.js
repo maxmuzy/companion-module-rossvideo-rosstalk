@@ -59,7 +59,7 @@ module.exports = {
 				id: 'discover',
 				label: 'Scan switcher on connect',
 				tooltip:
-					'Acuity/Vision only, needs TCP Keep Alive: asks the switcher for its input names, AUX buses and MLEs, and offers them as variables and in the "XPT (choose from scanned list)" action',
+					'Acuity/Vision model only: asks the switcher for its input names, AUX buses and MLEs, and offers them as variables and in the "XPT (choose from scanned list)" action',
 				width: 6,
 				default: true,
 			},

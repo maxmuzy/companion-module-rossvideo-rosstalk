@@ -21,13 +21,13 @@ To make sense of the input and output names available in the actions provided by
 
 **Acuity / Vision: scanning the switcher**
 
-With *TCP Keep Alive* on and *Scan switcher on connect* ticked, the module asks the switcher for its software version, the number of MLEs, the input names and the AUX buses (using the `?` queries of `XPT` and `MNEM`). The result is available as:
+With the *Acuity/Vision* model and *Scan switcher on connect* ticked, the module asks the switcher for its input names, the AUX buses, the number of MLEs and the software version (using the `?` queries of `XPT` and `MNEM`). With *TCP Keep Alive* on the scan runs over the persistent connection when it is established; without it, over a short connection of its own each time the configuration is saved. The result is available as:
 
 * Variables: `version`, `me_count`, `input_count`, `aux_bank_count`, `aux_count` and `input_<n>_name` (e.g. `$(rosstalk:input_1_name)`)
 * Action *XPT (choose from scanned list)*, with the destinations and sources found
 * Action *Re-scan switcher*, to pick up renamed inputs
 
-Vision wants `MLE` where Acuity accepts both `ME` and `MLE`; the scan detects which one the switcher answers to.
+Vision wants `MLE` where Acuity accepts both `ME` and `MLE`; the scan detects which one the switcher answers to. If a scan finds nothing, the module log shows the first replies the switcher gave, which tells what is going on. Variables stay at 0 until a scan has succeeded.
 
 **Logging**
 
