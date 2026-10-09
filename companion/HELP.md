@@ -19,6 +19,20 @@ To make sense of the input and output names available in the actions provided by
 * Transition Keyer
 * Fade to black
 
+**Acuity / Vision: scanning the switcher**
+
+With *TCP Keep Alive* on and *Scan switcher on connect* ticked, the module asks the switcher for its software version, the number of MLEs, the input names and the AUX buses (using the `?` queries of `XPT` and `MNEM`). The result is available as:
+
+* Variables: `version`, `me_count`, `input_count`, `aux_bank_count`, `aux_count` and `input_<n>_name` (e.g. `$(rosstalk:input_1_name)`)
+* Action *XPT (choose from scanned list)*, with the destinations and sources found
+* Action *Re-scan switcher*, to pick up renamed inputs
+
+Vision wants `MLE` where Acuity accepts both `ME` and `MLE`; the scan detects which one the switcher answers to.
+
+**Logging**
+
+Every command sent and every response received is written to the module log (tick *Log commands and responses* off to move them to debug level). Connection problems, commands that could not be sent and a switcher closing the connection are logged as warnings or errors.
+
 **Available commands for Ross Xpression**
 
 This module does not support Xpression, instead use the dedicated module: [companion-module-rossvideo-xpression](https://github.com/bitfocus/companion-module-rossvideo-xpression)

@@ -5,20 +5,7 @@ module.exports = {
 
 		const re_meSource_meNumber = '/^(ME|MME|MSC):[0-9]{1,2}$/'
 
-		const sendCommand = (cmd) => {
-			if (cmd !== undefined) {
-				if (!self.config.keepAlive) {
-					self.init_tcp(cmd);
-				}
-				else if (self.socket !== undefined && self.socket.isConnected) {
-					self.log('debug', `sending tcp ${cmd} to ${self.config.host}`)
-					self.socket.send(cmd + '\r\n')
-				} else {
-					self.log('debug', 'Socket not connected :(')
-				}
-			}
-		}
-
+		const sendCommand = (cmd) => self.sendCommand(cmd)
 
 		let actions = {
 			gpi: {
@@ -659,6 +646,8 @@ module.exports = {
 				},
 			}
 		}
+
+		Object.assign(actions, self.discoveryActions())
 
 		this.setActionDefinitions(actions)
 	},

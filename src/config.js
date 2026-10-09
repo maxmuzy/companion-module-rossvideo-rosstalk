@@ -54,6 +54,23 @@ module.exports = {
 				width: 6,
 				default: false,
 			},
+			{
+				type: 'checkbox',
+				id: 'discover',
+				label: 'Scan switcher on connect',
+				tooltip:
+					'Acuity/Vision only, needs TCP Keep Alive: asks the switcher for its input names, AUX buses and MLEs, and offers them as variables and in the "XPT (choose from scanned list)" action',
+				width: 6,
+				default: true,
+			},
+			{
+				type: 'checkbox',
+				id: 'logCommands',
+				label: 'Log commands and responses',
+				tooltip: 'Log every command sent and every response received in the module log. When off they are logged at debug level',
+				width: 6,
+				default: true,
+			},
 		]
 	},
 }
